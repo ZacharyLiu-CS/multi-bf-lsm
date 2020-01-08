@@ -30,7 +30,7 @@ namespace leveldb
 
 namespace
 {
-static uint32_t BloomHash(const Slice &key, int id)
+static uint32_t BloomHash(const Slice &key, int id = 0)
 {
 	switch (id)
 	{
@@ -230,21 +230,23 @@ public:
 
 		for (int i = 0; i < n; i++)
 		{
-			uint32_t h = BloomHash(keys[i], id_);
+			// use to locate the num of lines
+			uint32_t line_h = BloomHash(keys[i]);
+			uint32_t key_h = BloomHash(keys[i], id_);
 
 			const int log2_cache_line_bits = LOG2_CACHE_LINE_BYTES + 3;
 
 			char *data_at_offset =
-				array + (GetLine(h, num_lines) << LOG2_CACHE_LINE_BYTES);
-			const uint32_t delta = (h >> 17) | (h << 15);
+				array + (GetLine(line_h, num_lines) << LOG2_CACHE_LINE_BYTES);
+			const uint32_t delta = (key_h >> 17) | (key_h << 15);
 			for (int i = 0; i < k_; ++i) {
 				// Mask to bit-within-cache-line address
-				const uint32_t bitpos = h & ((1 << log2_cache_line_bits) - 1);
+				const uint32_t bitpos = key_h & ((1 << log2_cache_line_bits) - 1);
 				data_at_offset[bitpos / 8] |= (1 << (bitpos % 8));
 				if (ExtraRotates) {
-					h = (h >> log2_cache_line_bits) | (h << (32 - log2_cache_line_bits));
+					key_h = (key_h >> log2_cache_line_bits) | (key_h << (32 - log2_cache_line_bits));
 				}
-				h += delta;
+				key_h += delta;
 			}
 		}
 	}
@@ -269,21 +271,20 @@ public:
 		*byte_offset = b;
 	}
 
-	inline bool HashMayMatchPrepared(uint32_t h, int num_probes,
+	inline bool HashMayMatchPrepared(uint32_t key_h, int num_probes,
                                           const char *data_at_offset) const {
 		const int log2_cache_line_bits = LOG2_CACHE_LINE_BYTES + 3;
-
-		const uint32_t delta = (h >> 17) | (h << 15);
+		const uint32_t delta = (key_h >> 17) | (key_h << 15);
 		for (int i = 0; i < num_probes; ++i) {
 			// Mask to bit-within-cache-line address
-			const uint32_t bitpos = h & ((1 << log2_cache_line_bits) - 1);
+			const uint32_t bitpos = key_h & ((1 << log2_cache_line_bits) - 1);
 			if (((data_at_offset[bitpos / 8]) & (1 << (bitpos % 8))) == 0) {
 				return false;
 			}
 			if (ExtraRotates) {
-				h = (h >> log2_cache_line_bits) | (h << (32 - log2_cache_line_bits));
+				key_h = (key_h >> log2_cache_line_bits) | (key_h << (32 - log2_cache_line_bits));
 			}
-			h += delta;
+			key_h += delta;
 		}
 		return true;
 	}
@@ -308,11 +309,12 @@ public:
 			return true;
 		}
 
-		uint32_t h = BloomHash(key, id_);
+		uint32_t line_h = BloomHash(key);
+		uint32_t key_h = BloomHash(key, id_);
 
 		uint32_t byte_offset;
-		PrepareHashMayMatch(h, num_lines, array, &byte_offset);
-		return HashMayMatchPrepared(h, k, array + byte_offset);
+		PrepareHashMayMatch(line_h, num_lines, array, &byte_offset);
+		return HashMayMatchPrepared(key_h, k, array + byte_offset);
 	}
 
 	virtual int filterNums() const
@@ -545,7 +547,9 @@ bool MultiFilter::end_thread(false);
 
 
 MultiFilters::~MultiFilters() {
-
+	free(this->merged_filters);
+	for(auto iter: this->seperated_filters)
+		iter.clear();
 }
 
 void MultiFilters::addFilter(Slice &contents) {
@@ -589,11 +593,119 @@ void MultiFilters::removeFilter() {
 }
 
 void MultiFilters::merge() {
+	//decide the target size
+	uint32_t merged_filters_size = 0;
+	for(Slice iter : this->seperated_filters){
+		merged_filters_size += iter.size() - 5;
+	}
 
+	this->merged_filters ->resize(merged_filters_size + 5);
+	char * dst = &(*this->merged_filters)[0];
+	// copy the tail information from front elements
+	auto front_filter = this->seperated_filters.front().data();
+	uint32_t font_filter_len = this->seperated_filters.front().size();
+	dst[merged_filters_size] = front_filter[font_filter_len - 5];
+	uint32_t num_lines = DecodeFixed32(front_filter + font_filter_len - 4);
+	EncodeFixed32(dst + merged_filters_size + 1,static_cast<uint32_t>(num_lines));
+
+	//get needed information: numlines, start to copy inforamtion
+	int k = this->seperated_filters.size();
+	for(uint32_t i = 0; i < num_lines; i++){
+		char *tmp = dst + i * k * CACHE_LINE_SIZE;
+		uint32_t offset = 0;
+		for(auto iter : this->seperated_filters){
+			memcpy(tmp + offset,iter.data() + i* CACHE_LINE_SIZE, CACHE_LINE_SIZE);
+			offset += CACHE_LINE_SIZE;
+		}
+	}
+	
 }
 
 void MultiFilters::seperate() {
+	uint32_t source_size = this->merged_filters->size() -5;
+	uint32_t dst_size = source_size/5;
+	char * source = &(*this->merged_filters)[0];
+	const size_t num_lines = DecodeFixed32(source + source_size +1);
+	
+	//init the sepearted_filters
+	std::list<std::string *> tmp_list;
+	for(int i = 0 ; i < this->curr_num_of_filters; i++){
+		std::string*tmp;
+		tmp->resize(dst_size+5);
+		char * target = &(*tmp)[0];
+		target[dst_size] = source[source_size];
+		EncodeFixed32(target + dst_size +1,static_cast<uint32_t>(num_lines));
+		tmp_list.push_back(tmp);
+	}
+	for(int i = 0; i < num_lines; i++){
+		uint32_t source_offset = i * this->curr_num_of_filters * CACHE_LINE_SIZE;
+		uint32_t dst_offset = i * CACHE_LINE_SIZE;
+		uint32_t multi_cache_line_offset = 0;
 
+		for(auto iter: tmp_list){
+			char * dst = &(*iter)[0];
+			memcpy(dst + dst_offset, source + source_offset + multi_cache_line_offset,CACHE_LINE_SIZE);
+			multi_cache_line_offset += CACHE_LINE_SIZE;
+		}
+	}
+
+	this->seperated_filters.clear();
+	for(auto iter: tmp_list){
+		this->seperated_filters.push_back(Slice(*iter));	
+	}
+	
+	delete [] this->merged_filters;
+	
+
+
+}
+
+void MultiFilters::push_back_merged_filters(const Slice &contents){
+	uint32_t input_size = contents.size() - 5;
+	uint32_t dst_size = input_size + this->merged_filters->size() - 5;
+	const char *input_data = contents.data();
+	char * dst = &(*this->merged_filters)[0];
+	this->merged_filters->resize(dst_size + 5);
+
+	//start to move the tail information
+	dst[dst_size] = input_data[input_size];
+	uint32_t num_lines = DecodeFixed32(input_data + input_size + 1);
+	EncodeFixed32(dst + dst_size + 1,static_cast<uint32_t>(num_lines));
+	//move the dst elements for space
+	for(uint32_t i = num_lines - 1; i >= 0; i--){
+		uint32_t origin_offset = i * this->curr_num_of_filters * CACHE_LINE_SIZE;
+		uint32_t dst_offset = i*(this->curr_num_of_filters+1) *CACHE_LINE_SIZE;
+		memcpy(dst+dst_offset,dst+ origin_offset,this->curr_num_of_filters*CACHE_LINE_SIZE);
+	}
+
+	//copy the input elements to dst
+	for(uint32_t i = num_lines -1; i >= 0; i--){
+		uint32_t origin_offset = i * CACHE_LINE_SIZE;
+		uint32_t dst_offset = i*(this->curr_num_of_filters+1) *CACHE_LINE_SIZE + this->curr_num_of_filters * CACHE_LINE_SIZE;
+		memcpy(dst+dst_offset,input_data+ origin_offset,CACHE_LINE_SIZE);
+	}
+	this->curr_num_of_filters ++;
+}
+
+void MultiFilters::pop_back_merged_filters(){
+	uint32_t input_size = this->merged_filters->size() - 5;
+	char *input , *dst;
+	input = dst = &(*this->merged_filters)[0];
+	uint32_t num_lines = DecodeFixed32(input + input_size + 1);
+	uint32_t k_ = input[input_size];
+	uint32_t dst_size =  this->merged_filters->size() - num_lines*CACHE_LINE_SIZE- 5;	
+
+	//start to move data
+	for(int i = 0 ; i < num_lines; i++){
+		uint32_t origin_offset = i*this->curr_num_of_filters*CACHE_LINE_SIZE;
+		uint32_t dst_offset = i*(this->curr_num_of_filters-1)*CACHE_LINE_SIZE;
+		memcpy(dst + dst_offset,input + origin_offset,(this->curr_num_of_filters-1)*CACHE_LINE_SIZE);
+	}
+	this->merged_filters->resize(dst_size + 5);
+	dst[dst_size] = k_;
+	EncodeFixed32(dst+dst_size + 1,static_cast<uint32_t>(num_lines));
+	this->curr_num_of_filters --;
+	
 }
 
 size_t *leveldb::FilterPolicy::bits_per_key_per_filter_ = nullptr;
