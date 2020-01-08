@@ -494,7 +494,7 @@ public:
 		std::vector<ChildPolicy *>::const_iterator filter_iter = filters.begin();
 
 		if (!multi_filters->is_merged) {
-			for (std::list<Slice>::const_iterator filter_strs_iter = multi_filters->seperated_filters.begin(); filter_strs_iter != multi_filters->seperated_filters.end(); filter_strs_iter++)
+			for (std::list<Slice>::const_iterator filter_strs_iter = multi_filters->separated_filters.begin(); filter_strs_iter != multi_filters->separated_filters.end(); filter_strs_iter++)
 			{
 				if (!(*filter_iter)->KeyMayMatch(key, *filter_strs_iter))
 				{
@@ -548,13 +548,13 @@ bool MultiFilter::end_thread(false);
 
 MultiFilters::~MultiFilters() {
 	free(this->merged_filters);
-	for(auto iter: this->seperated_filters)
+	for(auto iter: this->separated_filters)
 		iter.clear();
 }
 
 void MultiFilters::addFilter(Slice &contents) {
 	if (!is_merged && !is_compressed) {
-		seperated_filters.push_back(contents);
+		separated_filters.push_back(contents);
 		curr_num_of_filters++;
 
 		if (curr_num_of_filters >= FilterMergeThreshold) {
@@ -563,9 +563,9 @@ void MultiFilters::addFilter(Slice &contents) {
 		}
 	} else { //merged filters
 		//Waiting to be optimized
-		seperate();
+		separate();
 
-		seperated_filters.push_back(contents);
+		separated_filters.push_back(contents);
 		curr_num_of_filters++;
 
 		merge();
@@ -574,18 +574,18 @@ void MultiFilters::addFilter(Slice &contents) {
 
 void MultiFilters::removeFilter() {
 	if (!is_merged && !is_compressed) {
-		seperated_filters.pop_back();
+		separated_filters.pop_back();
 		curr_num_of_filters--;
 	} else if (curr_num_of_filters == FilterMergeThreshold) {
 		is_merged = false;
-		seperate();
+		separate();
 
-		seperated_filters.pop_back();
+		separated_filters.pop_back();
 		curr_num_of_filters--;
 	} else { //Waiting to be optimized
-		seperate();
+		separate();
 
-		seperated_filters.pop_back();
+		separated_filters.pop_back();
 		curr_num_of_filters--;
 
 		merge();
@@ -595,25 +595,25 @@ void MultiFilters::removeFilter() {
 void MultiFilters::merge() {
 	//decide the target size
 	uint32_t merged_filters_size = 0;
-	for(Slice iter : this->seperated_filters){
+	for(Slice iter : this->separated_filters){
 		merged_filters_size += iter.size() - 5;
 	}
 
 	this->merged_filters ->resize(merged_filters_size + 5);
 	char * dst = &(*this->merged_filters)[0];
 	// copy the tail information from front elements
-	auto front_filter = this->seperated_filters.front().data();
-	uint32_t font_filter_len = this->seperated_filters.front().size();
+	auto front_filter = this->separated_filters.front().data();
+	uint32_t font_filter_len = this->separated_filters.front().size();
 	dst[merged_filters_size] = front_filter[font_filter_len - 5];
 	uint32_t num_lines = DecodeFixed32(front_filter + font_filter_len - 4);
 	EncodeFixed32(dst + merged_filters_size + 1,static_cast<uint32_t>(num_lines));
 
 	//get needed information: numlines, start to copy inforamtion
-	int k = this->seperated_filters.size();
+	int k = this->separated_filters.size();
 	for(uint32_t i = 0; i < num_lines; i++){
 		char *tmp = dst + i * k * CACHE_LINE_SIZE;
 		uint32_t offset = 0;
-		for(auto iter : this->seperated_filters){
+		for(auto iter : this->separated_filters){
 			memcpy(tmp + offset,iter.data() + i* CACHE_LINE_SIZE, CACHE_LINE_SIZE);
 			offset += CACHE_LINE_SIZE;
 		}
@@ -621,7 +621,7 @@ void MultiFilters::merge() {
 	
 }
 
-void MultiFilters::seperate() {
+void MultiFilters::separate() {
 	uint32_t source_size = this->merged_filters->size() -5;
 	uint32_t dst_size = source_size/5;
 	char * source = &(*this->merged_filters)[0];
@@ -649,9 +649,9 @@ void MultiFilters::seperate() {
 		}
 	}
 
-	this->seperated_filters.clear();
+	this->separated_filters.clear();
 	for(auto iter: tmp_list){
-		this->seperated_filters.push_back(Slice(*iter));	
+		this->separated_filters.push_back(Slice(*iter));	
 	}
 	
 	delete [] this->merged_filters;

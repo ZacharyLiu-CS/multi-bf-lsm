@@ -35,7 +35,7 @@ class ChildPolicy;
 
 class MultiFilters {
   public:
-    std::list<Slice> seperated_filters;
+    std::list<Slice> separated_filters;
     std::string* merged_filters;
 
     bool is_merged;
@@ -48,7 +48,7 @@ class MultiFilters {
     void removeFilter();
     
     void merge();    
-    void seperate();    
+    void separate();    
     void push_back_merged_filters(const Slice &contents);
     void pop_back_merged_filters();
 };
